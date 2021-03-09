@@ -14,6 +14,8 @@
 package dag
 
 import (
+	contour_api_v1 "github.com/projectcontour/contour/apis/projectcontour/v1"
+	"github.com/projectcontour/contour/internal/annotation"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -101,12 +103,6 @@ func selectorMatches(selector metav1.LabelSelector, objLabels map[string]string)
 }
 
 func (p *GatewayAPIProcessor) computeHTTPRoute(route *gatewayapi_v1alpha1.HTTPRoute) {
-
-	// Validate TLS Configuration
-	if route.Spec.TLS != nil {
-		p.Error("NOT IMPLEMENTED: The 'RouteTLSConfig' is not yet implemented.")
-	}
-
 	// Determine the hosts on the route, if no hosts
 	// are defined, then set to "*".
 	var hosts []string
@@ -151,7 +147,6 @@ func (p *GatewayAPIProcessor) computeHTTPRoute(route *gatewayapi_v1alpha1.HTTPRo
 
 		// Process any valid forwardTo.
 		for _, forward := range forwardTos {
-
 			meta := types.NamespacedName{Name: *forward.ServiceName, Namespace: route.Namespace}
 
 			// TODO: Refactor EnsureService to take an int32 so conversion to intstr is not needed.
@@ -171,10 +166,37 @@ func (p *GatewayAPIProcessor) computeHTTPRoute(route *gatewayapi_v1alpha1.HTTPRo
 
 		routes := p.routes(pathPrefixes, services)
 		for _, vhost := range hosts {
-			vhost := p.dag.EnsureVirtualHost(vhost)
-			for _, route := range routes {
-				vhost.addRoute(route)
+			// Validate TLS Configuration
+			if route.Spec.TLS != nil {
+				// TODO: Validate this is a v1.Secret type (right now it's assumed)
+				sec, err := p.source.LookupSecret(
+					types.NamespacedName{
+						Name:      route.Spec.TLS.CertificateRef.Name,
+						Namespace: route.Namespace,
+					},
+					validSecret)
+
+				if err != nil {
+					p.Errorf(contour_api_v1.ConditionTypeTLSError, "SecretNotValid",
+						"Spec.VirtualHost.TLS Secret %q is invalid: %s", route.Spec.TLS.CertificateRef.Name, err)
+					return
+				}
+
+				svhost := p.dag.EnsureSecureVirtualHost(vhost)
+				svhost.Secret = sec
+				// default to a minimum TLS version of 1.2 if it's not specified
+				// TODO: Read from Spec & move the default into a single place.
+				svhost.MinTLSVersion = annotation.MinTLSVersion("", "1.2")
+				addRoutes(svhost, routes)
+
+				// Until these issues are not addressed, there is no 301 redirect to
+				// SecureVirtualHost, so continue here.
+				// http://github.com/kubernetes-sigs/gateway-api/issues/51
+				// http://github.com/kubernetes-sigs/gateway-api/issues/35
+				continue
 			}
+			vhost := p.dag.EnsureVirtualHost(vhost)
+			addRoutes(vhost, routes)
 		}
 	}
 }
